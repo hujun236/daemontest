@@ -11,6 +11,8 @@ daemonrun
 /claw
 /claw-*
 /claw_*
+/cmd/claw/claw
+/cmd/claw/claw.exe
 
 # debug binary
 cli

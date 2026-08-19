@@ -258,9 +258,6 @@ func GetLocalInfo(logger Logger) (int, error) {
 	if cachedNum, cachedTs, ok := loadLocationCache(); ok {
 		age := time.Since(time.Unix(cachedTs, 0))
 		if age < locationTTL {
-			if logger != nil {
-				logger.Infof("[loc] using cached location: %d (age=%s)", cachedNum, age.Round(time.Second))
-			}
 			return cachedNum, nil
 		}
 		if logger != nil {

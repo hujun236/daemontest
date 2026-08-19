@@ -439,7 +439,6 @@ func rawTerminalPassthrough(conn *websocket.Conn, sessionID string, sessionName 
 	if termRows < 1 {
 		termRows = 1
 	}
-	traceLog("attach terminal size: cols=%d rows=%d termRows=%d", cols, rows, termRows)
 	conn.WriteJSON(Message{
 		Type:      TypeResize,
 		SessionID: sessionID,
@@ -456,7 +455,6 @@ func rawTerminalPassthrough(conn *websocket.Conn, sessionID string, sessionName 
 		xterm.WithRows(termRows),
 		xterm.WithScrollback(1000),
 	)
-	traceLog("xterm-go created: cols=%d rows=%d scrollback=%d", cols, rows, 1000)
 	// dirty row tracking — single channel collects all dirty row signals, capacity 128 for burst output
 	type renderSignal struct {
 		allDirty bool // true = full redraw
@@ -496,7 +494,6 @@ func rawTerminalPassthrough(conn *websocket.Conn, sessionID string, sessionName 
 		}
 
 		termMu.Lock()
-		_renderT0 := time.Now()
 
 		// detect terminal size change
 		if newCols, newRows := getTerminalSize(); newCols > 0 && newRows > 0 {
@@ -671,10 +668,6 @@ func rawTerminalPassthrough(conn *websocket.Conn, sessionID string, sessionName 
 		sb.WriteString("\033[?7h")
 		termMu.Unlock()
 		if sb.Len() > 0 {
-			_took := time.Since(_renderT0).Milliseconds()
-			if _took > 50 {
-				traceLog("RENDER_SLOW: %dms sb.Len=%d all=%v", _took, sb.Len(), allDirty)
-			}
 			select {
 			case stdoutCh <- sb.String():
 			default:
@@ -706,12 +699,7 @@ func rawTerminalPassthrough(conn *websocket.Conn, sessionID string, sessionName 
 		for {
 			select {
 			case s := <-stdoutCh:
-				_t0 := time.Now()
 				os.Stdout.WriteString(s)
-				_t := time.Since(_t0).Milliseconds()
-				if _t > 50 {
-					traceLog("STDOUT_SLOW: %dms len=%d", _t, len(s))
-				}
 			case <-done:
 				// after done closes, drain stdoutCh and discard residual frames
 				// note: discard only, do not write, because kick/disconnect messages were written to os.Stdout directly, writing residual frames would overwrite
@@ -774,11 +762,7 @@ func rawTerminalPassthrough(conn *websocket.Conn, sessionID string, sessionName 
 					}
 				}
 				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							traceLog("renderScreen panic: %v", r)
-						}
-					}()
+					defer func() { recover() }()
 					renderScreen(dirtySet, allDirty)
 				}()
 			case <-done:
@@ -814,7 +798,6 @@ func rawTerminalPassthrough(conn *websocket.Conn, sessionID string, sessionName 
 							termRows = 1
 						}
 						localTerm.Resize(cols, termRows)
-						traceLog("resize(SIGWINCH): cols=%d rows=%d termRows=%d", cols, rows, termRows)
 					}
 					termMu.Unlock()
 					// notify daemon PTY resize
@@ -840,7 +823,6 @@ func rawTerminalPassthrough(conn *websocket.Conn, sessionID string, sessionName 
 						}
 						localTerm.Resize(cols, termRows)
 						termMu.Unlock()
-						traceLog("resize(poll): cols=%d rows=%d termRows=%d", cols, rows, termRows)
 						// notify daemon PTY resize
 						conn.WriteJSON(Message{
 							Type:      TypeResize,
@@ -862,14 +844,12 @@ func rawTerminalPassthrough(conn *websocket.Conn, sessionID string, sessionName 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				traceLog("WS reader panic: %v", r)
 				safeClose()
 			}
 		}()
 		for {
 			_, msgBytes, err := conn.ReadMessage()
 			if err != nil {
-				traceLog("CLI WS reader: ReadMessage error: %v (intentional=%v)", err, intentionalDetach.Load())
 				// connection closed (server close = kicked, intentional detach already flagged, not considered kicked)
 				if !intentionalDetach.Load() {
 					os.Stdout.Write([]byte("\r\n\033[31m*** connection lost ***\033[0m\r\n"))
@@ -887,16 +867,9 @@ func rawTerminalPassthrough(conn *websocket.Conn, sessionID string, sessionName 
 			switch msg.Type {
 			case TypeOutput, TypeHistoryData, TypeHistoryChunk:
 				if len(msg.Data) > 0 {
-					traceHex("STDOUT<<", []byte(msg.Data))
-					t0 := time.Now()
 					termMu.Lock()
-					lockWait := time.Since(t0).Microseconds()
 					localTerm.Write([]byte(msg.Data))
-					writeTime := time.Since(t0).Microseconds()
 					termMu.Unlock()
-					if lockWait > 1000 || writeTime > 10000 {
-						traceLog("WS_W slow: lock_wait=%dµs write=%dµs len=%d", lockWait, writeTime, len(msg.Data))
-					}
 				}
 			default:
 				// ignore other types
@@ -913,22 +886,15 @@ func rawTerminalPassthrough(conn *websocket.Conn, sessionID string, sessionName 
 		var lastScrollTime time.Time
 		var scrollAccel int     // current acceleration multiplier
 		var scrollDir int       // last scroll direction: 1=down, -1=up
-		var stdinLastRead time.Time
 
 		for {
 			n, err := readStdin(buf)
-			gap := time.Since(stdinLastRead).Milliseconds()
-			stdinLastRead = time.Now()
-			if gap > 100 {
-				traceLog("STDIN_GAP=%dms n=%d", gap, n)
-			}
 			if err != nil {
 				safeClose()
 				return
 			}
 
 			data := buf[:n]
-				traceHex("STDIN>>", data)
 			processed := make([]byte, 0, len(data))
 			scrollHandled := false
 

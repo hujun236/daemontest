@@ -163,14 +163,23 @@ func (w *WSTurnRelay) Connect(url string) error {
 }
 
 // SendRaw send raw JSON bytes (text frame)
+// NOTE: only take a conn snapshot inside the RLock — never hold the lock while
+// parking on the sendCh send. Holding RLock across a full-channel send together
+// with writeMsg's exclusive Lock forms a deadlock cycle (handler holds RLock
+// waiting for writeLoop to drain; writeLoop waits for Lock) that permanently
+// wedges the relay when the TCP link dies silently.
 func (w *WSTurnRelay) SendRaw(data []byte) {
 	w.mu.RLock()
-	defer w.mu.RUnlock()
-	if w.conn != nil && w.connected {
-		select {
-		case w.sendCh <- relayMsg{data: data, msgType: websocket.TextMessage}:
-		case <-w.closeCh:
-		}
+	conn := w.conn
+	connected := w.connected
+	w.mu.RUnlock()
+
+	if conn == nil || !connected {
+		return
+	}
+	select {
+	case w.sendCh <- relayMsg{data: data, msgType: websocket.TextMessage}:
+	case <-w.closeCh:
 	}
 }
 
@@ -216,18 +225,23 @@ func (w *WSTurnRelay) SendBinary(data []byte) {
 }
 
 // SendJSON send JSON message via WebSocket (via sendCh text channel)
+// Same rule as SendRaw: no lock held while parking on the channel send.
 func (w *WSTurnRelay) SendJSON(msg *Message) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return
 	}
 	w.mu.RLock()
-	defer w.mu.RUnlock()
-	if w.conn != nil && w.connected {
-		select {
-		case w.sendCh <- relayMsg{data: data, msgType: websocket.TextMessage}:
-		case <-w.closeCh:
-		}
+	conn := w.conn
+	connected := w.connected
+	w.mu.RUnlock()
+
+	if conn == nil || !connected {
+		return
+	}
+	select {
+	case w.sendCh <- relayMsg{data: data, msgType: websocket.TextMessage}:
+	case <-w.closeCh:
 	}
 }
 
@@ -365,6 +379,13 @@ func (w *WSTurnRelay) writeMsg(msg relayMsg) {
 	if conn == nil {
 		return
 	}
+	// Write deadline: on a silently-dead link (no FIN/RST) writes into the
+	// kernel send buffer "succeed" for a long time and nothing ever errors.
+	// A deadline guarantees a stuck write fails within 10s, triggering
+	// Close() → closeCh → every goroutine parked on sendCh unwinds and the
+	// supervisor loop reconnects. Pings every 8s ensure outbound traffic is
+	// always pending, so detection is bounded at ~18s.
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if err := conn.WriteMessage(msg.msgType, msg.data); err != nil {
 		w.Close()
 	}

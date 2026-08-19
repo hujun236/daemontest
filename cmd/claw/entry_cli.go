@@ -154,10 +154,7 @@ func runDaemonProcess() {
 	connectedCh := make(chan error, 1)
 	d.OnStateChange = func(state string) {
 		switch state {
-		case "connecting":
-			writeEarlyLog("[ts] connecting to turn server...")
 		case "connected":
-			writeEarlyLog("[ts] connected successfully")
 			select {
 			case connectedCh <- nil:
 			default:

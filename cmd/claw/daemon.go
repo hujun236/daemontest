@@ -1287,7 +1287,6 @@ func (d *Daemon) sendOutput(sessionID, data string, seq uint64) {
 	// 1. broadcast to all local controllers
 	session := d.ptyMgr.Get(sessionID)
 	if session != nil {
-		traceHex("DAEMON PTY_READ>>", []byte(data))
 		session.Broadcast([]byte(data))
 	}
 

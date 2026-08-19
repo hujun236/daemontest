@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -299,8 +298,6 @@ func (ls *LocalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ls.clientSessionsMu.Unlock()
 
 		case TypeInput:
-			log.Printf("[DAEMON] TypeInput sessionID=%q data=%q", msg.SessionID, msg.Data)
-			traceHex("DAEMON PTY_WRITE<<", []byte(msg.Data))
 			ls.daemon.ptyMgr.Write(msg.SessionID, []byte(msg.Data))
 
 		case TypeResize:
