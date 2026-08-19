@@ -58,6 +58,16 @@ type Daemon struct {
 	secCodeVerified      int32
 	secCodeAttemptsLeft  int32
 
+	// E2E secure channel (SPAKE2 + AES-GCM). secure is nil until a handshake
+	// completes; the single-slot handshake fields track one in-progress SPAKE2
+	// server exchange (a new pake_start overwrites any previous one).
+	secure       *SecureChannel
+	secureMu     sync.Mutex
+	pakeServer   *Spake2State
+	pakeSid      []byte
+	pakeAccessKey string
+	pakeTimer    *time.Timer
+
 	// set of sessions subscribed by frontend: only sessions that went through request_history receive real-time output
 	subscribed map[string]bool
 	subMu      sync.RWMutex
@@ -188,6 +198,8 @@ func (d *Daemon) handleP2PSignal(raw map[string]any) {
 		// Note: secCodeAttemptsLeft is NOT reset — it is a daemon-lifetime budget
 		d.logger.Infof("[TS] peer_online: new app connection, resetting secCodeVerified")
 		atomic.StoreInt32(&d.secCodeVerified, 0)
+		// Keys are per-connection: a new peer must re-run the handshake.
+		d.resetSecure("peer_online")
 
 	case "peer_offline":
 		d.handlePeerOffline()
@@ -205,6 +217,7 @@ func (d *Daemon) startP2PAsAnswerer(sdpOffer string, earlyICE []map[string]any) 
 	// New app connection: reset security-code verification state
 	// Note: secCodeAttemptsLeft is NOT reset — it is a daemon-lifetime budget
 	atomic.StoreInt32(&d.secCodeVerified, 0)
+	d.resetSecure("p2p_offer")
 
 	// close old P2P connection
 	d.CloseRTC()
@@ -483,6 +496,8 @@ func (d *Daemon) tsRelayLoop(ctx context.Context) {
 
 		// 2. connecting directly to TS
 		relay := NewWSTurnRelay(d.accessKey, d.cfg, d.logger)
+		relay.SecCodeEnabled = HasSecurityCode()
+		relay.SecureCap = true
 		relay.OnMessage = func(msg *Message) {
 			d.handleMessage(msg, "TS")
 		}
@@ -737,7 +752,19 @@ func (d *Daemon) Destroy() {
 
 // handleMessage handle messages from app (shared by WebRTC and WS)
 func (d *Daemon) handleMessage(msg *Message, source string) {
+	// E2E: decrypt encrypted envelopes before dispatch. When the secure channel
+	// is inactive any enc_* frame is dropped (protocol violation).
+	inner, ok := d.unwrapIncomingJSON(msg)
+	if !ok {
+		return
+	}
+	msg = inner
+
 	switch msg.Type {
+	case TypePakeStart:
+		d.handlePakeStart(msg)
+	case TypeSecConfirm:
+		d.handleSecConfirm(msg)
 	case TypeKicked:
 		if msg.Reason == "daemon_replaced" {
 			d.logger.Infof("[TS] kicked: new daemon with same accesskey connected, exiting")
@@ -853,6 +880,12 @@ func (d *Daemon) handleMessage(msg *Message, source string) {
 
 // handleBinary handle binary frames from frontend (routed by opcode)
 func (d *Daemon) handleBinary(data []byte) {
+	// E2E: unwrap encrypted binary frames (0x07) back to the original frame.
+	plain, ok := d.unwrapIncomingBinary(data)
+	if !ok {
+		return
+	}
+	data = plain
 	if len(data) == 0 {
 		return
 	}
@@ -998,10 +1031,6 @@ func (d *Daemon) sendHistoryChunks(sessionID string, data []byte, seq uint64) {
 			end = len(data)
 		}
 
-		d.channelMu.RLock()
-		mode := d.channelMode
-		d.channelMu.RUnlock()
-
 		chunkMsg := &Message{
 			Type:        TypeHistoryChunk,
 			SessionID:   sessionID,
@@ -1010,16 +1039,7 @@ func (d *Daemon) sendHistoryChunks(sessionID string, data []byte, seq uint64) {
 			TotalChunks: total,
 		}
 
-		if mode == "p2p" {
-			d.rtcMu.RLock()
-			rtc := d.rtc
-			d.rtcMu.RUnlock()
-			if rtc != nil {
-				rtc.SendJSONWithBackpressure(chunkMsg, 64*1024)
-			}
-		} else {
-			d.sendJSON(chunkMsg)
-		}
+		d.sendJSONWithBackpressure(chunkMsg, 64*1024)
 	}
 
 	// (3) send end completion signal
@@ -1038,8 +1058,10 @@ func (d *Daemon) handlePeerOffline() {
 
 	if mode == "p2p" {
 		// P2P connection is still active; only the TS relay dropped.
+		// Keep the secure channel (it rides the P2P DataChannel).
 		return
 	}
+	d.resetSecure("peer_offline")
 
 	if d.fileTransfer != nil {
 		d.fileTransfer.CancelAll()
@@ -1307,6 +1329,15 @@ func (d *Daemon) sendOutput(sessionID, data string, seq uint64) {
 
 // sendJSON send via current selected channel (single-channel mode, no auto-switch)
 func (d *Daemon) sendJSON(msg *Message) {
+	// E2E: wrap into an encrypted envelope when the secure channel is active and
+	// the type is not plaintext-exempt. On wrap failure the message is dropped
+	// (never falls back to plaintext).
+	if wrapped := d.wrapOutgoingJSON(msg); wrapped != nil {
+		msg = wrapped
+	} else {
+		return
+	}
+
 	d.channelMu.RLock()
 	mode := d.channelMode
 	d.channelMu.RUnlock()
@@ -1342,10 +1373,43 @@ func (d *Daemon) sendJSON(msg *Message) {
 	}
 }
 
+// sendJSONWithBackpressure sends a JSON message, applying the E2E envelope,
+// then hands it to the p2p path with backpressure (or the normal TS path).
+// Used by history chunks which bypass sendJSON in p2p mode.
+func (d *Daemon) sendJSONWithBackpressure(msg *Message, threshold uint64) {
+	if wrapped := d.wrapOutgoingJSON(msg); wrapped != nil {
+		msg = wrapped
+	} else {
+		return
+	}
+
+	d.channelMu.RLock()
+	mode := d.channelMode
+	d.channelMu.RUnlock()
+
+	if mode == "p2p" {
+		d.rtcMu.RLock()
+		rtc := d.rtc
+		rtcOK := rtc != nil && rtc.Connected()
+		d.rtcMu.RUnlock()
+		if rtcOK {
+			rtc.SendJSONWithBackpressure(msg, threshold)
+			return
+		}
+		return
+	}
+
+	d.wsMu.RLock()
+	relay := d.wsRelay
+	d.wsMu.RUnlock()
+	if relay != nil && relay.Connected() {
+		relay.SendJSON(msg)
+	}
+}
+
 // sendBytes send binary data via current selected channel
 func (d *Daemon) sendBytes(data []byte) {
-	if len(data) > 32*1024 {
-	}
+	data = d.wrapOutgoingBinary(data)
 	d.channelMu.RLock()
 	mode := d.channelMode
 	d.channelMu.RUnlock()
@@ -1383,6 +1447,7 @@ func (d *Daemon) sendBytes(data []byte) {
 
 // sendBytesWithBackpressure send binary data via current selected channel (with backpressure)
 func (d *Daemon) sendBytesWithBackpressure(data []byte, threshold uint64) {
+	data = d.wrapOutgoingBinary(data)
 	d.channelMu.RLock()
 	mode := d.channelMode
 	d.channelMu.RUnlock()
@@ -1411,8 +1476,7 @@ func (d *Daemon) sendBytesWithBackpressure(data []byte, threshold uint64) {
 
 // sendBytesCancelable blocking send with cancel (for file transfer, returns immediately when cancel is closed)
 func (d *Daemon) sendBytesCancelable(data []byte, threshold uint64, cancel <-chan struct{}) bool {
-	if len(data) > 32*1024 {
-	}
+	data = d.wrapOutgoingBinary(data)
 	d.channelMu.RLock()
 	mode := d.channelMode
 	d.channelMu.RUnlock()

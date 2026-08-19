@@ -55,6 +55,12 @@ type WSTurnRelay struct {
 	OnMessage       func(msg *Message)
 	OnBinaryMessage func(data []byte) // binary message callback
 	OnP2PSignal     func(msg map[string]any)
+
+	// E2E capability advertised in the login message: whether a security code is
+	// set and whether this daemon speaks SPAKE2. The relay forwards these to the
+	// app in login_ok so it can start the handshake immediately.
+	SecCodeEnabled bool
+	SecureCap      bool
 }
 
 // NewWSTurnRelay create WebSocket TURN client
@@ -95,9 +101,11 @@ func (w *WSTurnRelay) Connect(url string) error {
 
 	// send login
 	loginMsg, _ := json.Marshal(map[string]any{
-		"type":      "login",
-		"accesskey": w.accessKey,
-		"version":   Version,
+		"type":             "login",
+		"accesskey":        w.accessKey,
+		"version":          Version,
+		"sec_code_enabled": w.SecCodeEnabled,
+		"secure_cap":       w.SecureCap,
 	})
 	if err := conn.WriteMessage(websocket.TextMessage, loginMsg); err != nil {
 		conn.Close()

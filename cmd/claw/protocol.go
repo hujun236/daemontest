@@ -11,11 +11,35 @@ const MaxFrameSize = 31 * 1024 // 31KB
 // the daemon shuts down to prevent brute-force guessing of the 6-digit code.
 const MaxSecCodeAttempts = 10
 
+// Secure-channel (E2E encryption) limits. The TurnServer disconnects any frame
+// larger than 32KB, so encrypted payloads must stay comfortably under it.
+const (
+	// SecureMaxTextPayload is the max size of the *inner* JSON message body
+	// (before encryption). Base64 (×4/3) + AES-GCM tag (16B) + envelope JSON
+	// (~50B) must fit inside 32KB:
+	//   floor((32768-50)/4*3) - 16 ≈ 24537 → keep margin → 24000.
+	// Producers that can exceed this (e.g. dir_list of huge directories) were
+	// already at risk of hitting the plaintext 32KB frame limit; the assert in
+	// SecureChannel.WrapJSON surfaces any regression loudly instead of silently
+	// disconnecting.
+	SecureMaxTextPayload = 24000
+
+	// SecureBinaryOverhead is added to every binary frame when encryption is
+	// active: 1B opcode + 8B seq + 16B GCM tag.
+	SecureBinaryOverhead = 25
+)
+
 // Binary frame Opcodes (first byte)
 const (
 	OpcodeFileTransfer = 0x01 // file transfer: [0x01][4B fileId][4B chunkIdx][data...] (9-byte header)
 	// Reserved: 0x02 image, 0x03 clipboard, 0x04 port forwarding, etc.
 	OpcodeProxyData = 0x05 // proxy tunnel data: [0x05][4B connId BE][payload...] (5-byte header)
+
+	// OpcodeSecureBinary wraps an encrypted frame when the secure channel is
+	// active: [0x07][8B seq BE][AES-GCM ciphertext of the original frame
+	// including its own opcode byte]. Stays a binary frame so the relay's
+	// free-plan binary policy is preserved.
+	OpcodeSecureBinary = 0x07
 )
 
 // Fatal error flag — TS attaches this field to any "permanent, non-retryable"
@@ -54,6 +78,7 @@ const (
 	TypeChannelSelected = "channel_selected"
 	TypeChannelFailed   = "channel_failed"
 	TypeKicked          = "kicked"
+	TypePeerOnline      = "peer_online"
 	TypePeerOffline     = "peer_offline"
 
 	// file transfer
@@ -126,6 +151,22 @@ const (
 	TypeAskShortcut      = "ask_shortcut"      // Daemon→App: ask user whether to create desktop shortcut
 	TypeShortcutResponse = "shortcut_response" // App→Daemon: user's choice (Success=true means yes)
 	TypeShortcutResult   = "shortcut_result"   // Daemon→App: result of createDesktopShortcut (Success + Error)
+
+	// E2E secure channel (SPAKE2 handshake + encrypted data plane).
+	// Handshake messages are PLAINTEXT (the relay sees only these + the outer
+	// enc_* envelopes); the security code itself is never transmitted.
+	TypePakeStart    = "pake_start"    // App→Daemon: {sid, pa} begin SPAKE2
+	TypePakeReply    = "pake_reply"    // Daemon→App: {sid, pb} reply with server share
+	TypeSecConfirm   = "sec_confirm"   // App→Daemon: {tag_a} key confirmation
+	TypeSecOK        = "sec_ok"        // Daemon→App: {tag_b} handshake accepted
+	TypeSecureReady  = "secure_ready"  // Daemon→App: data plane now encrypted
+	TypeSecStatus    = "sec_status"    // TS→App: push daemon sec_code_enabled status
+
+	// Outer encrypted envelopes (type visible to the relay for policy/rate-limit).
+	// Inner payload = base64(AES-256-GCM(original JSON message)).
+	TypeEncTerm  = "enc_term"  // terminal I/O + generic data
+	TypeEncFile  = "enc_file"  // file transfer control + remote file browsing
+	TypeEncProxy = "enc_proxy" // proxy tunnel / HTTP fetch / WS proxy
 )
 
 // DataChannel JSON message envelope
@@ -165,6 +206,17 @@ type Message struct {
 
 	// security code verification: remaining attempts after a failed verify (0 = daemon shutting down)
 	RemainingAttempts int `json:"remaining_attempts,omitempty"`
+
+	// E2E secure channel:
+	// - SecCodeEnabled/SecureCap: daemon→TS in login, TS→App in login_ok/sec_status
+	// - Sid/Pa/Pb/TagA/TagB: SPAKE2 handshake fields (plaintext)
+	SecCodeEnabled bool   `json:"sec_code_enabled,omitempty"`
+	SecureCap      bool   `json:"secure_cap,omitempty"`
+	Sid            string `json:"sid,omitempty"`
+	Pa             string `json:"pa,omitempty"`
+	Pb             string `json:"pb,omitempty"`
+	TagA           string `json:"tag_a,omitempty"`
+	TagB           string `json:"tag_b,omitempty"`
 
 	// server manager
 	AccessKey  string     `json:"accesskey,omitempty"`

@@ -217,8 +217,12 @@ func (ftm *FileTransferManager) startSendFromStaged(filePath string) error {
 	fileSize := info.Size()
 	fileName := filepath.Base(filePath)
 	chunkSize := ftm.daemon.cfg.ChunkSize
-	if chunkSize <= 0 || chunkSize > MaxFrameSize-9 {
-		chunkSize = MaxFrameSize - 9 // 9-byte file transfer header
+	secureOverhead := 0
+	if ftm.daemon.secureActive() {
+		secureOverhead = SecureBinaryOverhead // encrypted binary envelope
+	}
+	if chunkSize <= 0 || chunkSize > MaxFrameSize-9-secureOverhead {
+		chunkSize = MaxFrameSize - 9 - secureOverhead // 9-byte file transfer header
 	}
 	totalChunks := int((fileSize + int64(chunkSize) - 1) / int64(chunkSize))
 	if totalChunks == 0 {
