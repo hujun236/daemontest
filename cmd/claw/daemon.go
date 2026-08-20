@@ -214,10 +214,12 @@ func (d *Daemon) handleP2PSignal(raw map[string]any) {
 func (d *Daemon) startP2PAsAnswerer(sdpOffer string, earlyICE []map[string]any) {
 	// new frontend sent p2p_offer, old connection is done, clearing kicked flag
 	atomic.StoreInt32(&d.kicked, 0)
-	// New app connection: reset security-code verification state
-	// Note: secCodeAttemptsLeft is NOT reset — it is a daemon-lifetime budget
-	atomic.StoreInt32(&d.secCodeVerified, 0)
-	d.resetSecure("p2p_offer")
+	// Note: the secure channel is deliberately NOT reset here. A browser-initiated
+	// p2p_offer can arrive mid-SPAKE2 on the TS channel (the app runs PAKE on TS
+	// while negotiating P2P in the background); wiping the handshake here drops the
+	// app's sec_confirm and strands the connection. The reset happens at the real
+	// channel switch (handleChannelSelect "p2p"), where keys must not cross channels.
+	// New connections are already reset by peer_online.
 
 	// close old P2P connection
 	d.CloseRTC()
@@ -1135,6 +1137,15 @@ func (d *Daemon) handleChannelSelect(msg *Message) {
 	channel := msg.Data // "p2p" or "ts"
 	if channel != "p2p" && channel != "ts" {
 		return
+	}
+
+	// TS→P2P switch: keys are per-channel, so tear down the encrypted channel
+	// before the app re-runs SPAKE2 on the P2P DataChannel. Done at the actual
+	// switch point (not at p2p_offer) so an in-flight TS handshake isn't wiped
+	// mid-negotiation. secCodeAttemptsLeft is NOT reset (daemon-lifetime budget).
+	if channel == "p2p" {
+		atomic.StoreInt32(&d.secCodeVerified, 0)
+		d.resetSecure("channel_switch_p2p")
 	}
 
 	d.channelMu.Lock()

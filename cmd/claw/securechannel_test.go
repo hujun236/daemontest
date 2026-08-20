@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -61,6 +62,39 @@ func TestSecureChannelJSONRoundTrip(t *testing.T) {
 	}
 	if got2.Type != TypeInput || got2.Data != "ls" {
 		t.Fatalf("input roundtrip mangled: %+v", got2)
+	}
+}
+
+// TestSecureEnvelopeSeqAlwaysPresent — regression: the FIRST encrypted message has
+// crypto seq 0. If the outer envelope omitted "seq" (omitempty on Message.Seq),
+// the app's unwrapJSON cast on a missing key would throw and drop the message —
+// which surfaced as "default shell history only appears after a 5s retry".
+func TestSecureEnvelopeSeqAlwaysPresent(t *testing.T) {
+	daemon, app := testChannels(t)
+
+	// First wrapped message from a fresh channel → seq must be 0.
+	outer, err := daemon.WrapJSON(&Message{Type: TypeHistoryData, SessionID: "s1", Data: "prompt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outer.Seq != 0 {
+		t.Fatalf("first wrapped message must use seq 0, got %d", outer.Seq)
+	}
+	raw, err := json.Marshal(outer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"seq":0`) {
+		t.Fatalf("envelope JSON must carry seq=0 explicitly (omitempty bug), got: %s", raw)
+	}
+
+	// And it must still decrypt on the app side.
+	inner, err := app.UnwrapJSON(outer)
+	if err != nil {
+		t.Fatalf("first message (seq 0) must decrypt: %v", err)
+	}
+	if inner.Type != TypeHistoryData || inner.Data != "prompt" {
+		t.Fatalf("first message roundtrip mangled: %+v", inner)
 	}
 }
 

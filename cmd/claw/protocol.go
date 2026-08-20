@@ -194,7 +194,7 @@ type Message struct {
 	Sessions     []string                 `json:"sessions,omitempty"`
 	SessionInfos []SessionInfo            `json:"session_infos,omitempty"`
 	Shells       []ShellInfo              `json:"shells,omitempty"`
-	Seq          uint64                   `json:"seq,omitempty"`
+	Seq          uint64                   `json:"seq"`
 	TotalChunks  int                      `json:"total_chunks"`
 	ChunkIndex   int                      `json:"chunk_index"`
 	Extra        map[string]any `json:"-"`
