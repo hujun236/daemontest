@@ -11,6 +11,15 @@ const MaxFrameSize = 31 * 1024 // 31KB
 // the daemon shuts down to prevent brute-force guessing of the 6-digit code.
 const MaxSecCodeAttempts = 10
 
+// defaultSecCode is used when the daemon has no real security code set: the
+// data plane is still ALWAYS encrypted (forced encryption), with this public
+// default acting as the PAKE password. It provides confidentiality against
+// passive eavesdropping but, being public, no authentication barrier — which
+// matches the semantics of a daemon without a code. The app only auto-tries it
+// when the daemon reports no real code (sec_code_enabled=false), so it never
+// burns the online-guess attempt budget on a code-protected daemon.
+const defaultSecCode = "000000"
+
 // Secure-channel (E2E encryption) limits. The TurnServer disconnects any frame
 // larger than 32KB, so encrypted payloads must stay comfortably under it.
 const (

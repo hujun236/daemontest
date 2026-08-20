@@ -9,8 +9,9 @@ package main
 // secCodeAttemptsLeft budget (10, daemon shuts down at 0) bounds online
 // guessing of the 6-digit code.
 //
-// The security code is loaded once per handshake via LoadSecurityCode(); the
-// handshake never transmits it.
+// The security code is loaded once per handshake via LoadSecurityCode(); when
+// empty the public default (defaultSecCode) is used so encryption is always on
+// (forced encryption). The handshake never transmits the code.
 
 import (
 	"encoding/base64"
@@ -21,15 +22,14 @@ import (
 const secureHandshakeTimeout = 10 * time.Second
 
 // handlePakeStart is the client's first handshake message: {sid, pa}.
-// Only valid when a security code is set; otherwise the app is expected to use
-// the legacy plaintext sec_code_verify path.
+// Forced encryption: EVERY connection must complete a SPAKE2 handshake. If the
+// daemon has no real security code, the public default (000000) is used as the
+// PAKE password (confidentiality only, no auth barrier — matches a no-code
+// daemon). The plaintext sec_code_verify path is gone.
 func (d *Daemon) handlePakeStart(msg *Message) {
-	if atomic.LoadInt32(&d.secCodeEnabled) == 0 {
-		return // no code → plaintext path; ignore
-	}
 	code := LoadSecurityCode()
 	if code == "" {
-		return
+		code = defaultSecCode
 	}
 
 	pa, err := base64.StdEncoding.DecodeString(msg.Pa)
@@ -112,8 +112,13 @@ func (d *Daemon) handleSecConfirm(msg *Message) {
 	d.secureMu.Unlock()
 
 	if !ok {
-		remaining := atomic.AddInt32(&d.secCodeAttemptsLeft, -1)
-		d.logger.Infof("[secure] sec_confirm rejected, remaining=%d", remaining)
+		remaining := int32(MaxSecCodeAttempts)
+		if atomic.LoadInt32(&d.secCodeEnabled) == 1 {
+			// 只有设置了真实安全码才防爆破。无码 daemon 的 PAKE 密码是公开的
+			// 000000，任何失败猜测都不该消耗额度（它本就没有认证屏障）。
+			remaining = atomic.AddInt32(&d.secCodeAttemptsLeft, -1)
+			d.logger.Infof("[secure] sec_confirm rejected, remaining=%d", remaining)
+		}
 		d.sendJSON(&Message{
 			Type:              TypeSecCodeError,
 			RemainingAttempts: int(remaining),

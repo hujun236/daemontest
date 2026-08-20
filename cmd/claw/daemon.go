@@ -790,8 +790,9 @@ func (d *Daemon) handleMessage(msg *Message, source string) {
 		d.subMu.Unlock()
 	case TypePeerOffline:
 		d.handlePeerOffline()
-	case TypeSecCodeVerify:
-		d.handleSecCodeVerify(msg)
+	// TypeSecCodeVerify (plaintext code) intentionally removed: forced
+	// encryption means verification only happens via the SPAKE2 handshake.
+	// A legacy app sending it gets no response → forced upgrade.
 	case TypeCreateSession:
 		if !d.checkSecCode() {
 			return
@@ -1077,58 +1078,17 @@ func (d *Daemon) handlePeerOffline() {
 	d.channelMu.Unlock()
 }
 
-// checkSecCode returns true if security code is not set or has been verified.
-// Pure atomic reads, no file IO.
+// checkSecCode returns true only if the current app connection has completed
+// the SPAKE2 handshake. Forced encryption: every remote operation is gated on
+// a finished handshake — the plaintext sec_code_verify path is removed, so a
+// connection that has not handshaken cannot do anything. Pure atomic read, no
+// file IO.
 func (d *Daemon) checkSecCode() bool {
-	if atomic.LoadInt32(&d.secCodeEnabled) == 0 {
-		return true
-	}
 	if atomic.LoadInt32(&d.secCodeVerified) == 1 {
 		return true
 	}
 	d.sendJSON(&Message{Type: TypeError, Error: "Security code required"})
 	return false
-}
-
-// handleSecCodeVerify verifies the security code sent by the remote client.
-// Each failed attempt decrements secCodeAttemptsLeft; when it reaches zero the
-// daemon shuts down to prevent brute-force guessing of the 6-digit code.
-func (d *Daemon) handleSecCodeVerify(msg *Message) {
-	code := LoadSecurityCode()
-	if code == "" {
-		atomic.StoreInt32(&d.secCodeVerified, 1)
-		d.sendJSON(&Message{Type: TypeSecCodeOK})
-		return
-	}
-	if msg.Data == code {
-		atomic.StoreInt32(&d.secCodeVerified, 1)
-		// Note: secCodeAttemptsLeft is NOT reset on success — daemon-lifetime budget
-		d.sendJSON(&Message{Type: TypeSecCodeOK})
-		return
-	}
-
-	// Wrong code: consume one attempt
-	left := atomic.AddInt32(&d.secCodeAttemptsLeft, -1)
-	if left <= 0 {
-		d.logger.Infof("[SECCODE] security code verify failed %d times, shutting down daemon", MaxSecCodeAttempts)
-		d.sendJSON(&Message{
-			Type:              TypeSecCodeError,
-			Error:             "Max verification attempts reached",
-			RemainingAttempts: 0,
-		})
-		// allow the message to flush before exiting
-		go func() {
-			time.Sleep(500 * time.Millisecond)
-			d.exitWithReason("sec_code_locked", "max verification attempts reached")
-		}()
-		return
-	}
-	d.logger.Infof("[SECCODE] security code verify failed, %d/%d attempts remaining", left, MaxSecCodeAttempts)
-	d.sendJSON(&Message{
-		Type:              TypeSecCodeError,
-		Error:             "Incorrect security code",
-		RemainingAttempts: int(left),
-	})
 }
 
 // handleChannelSelect handle browser channel selection.

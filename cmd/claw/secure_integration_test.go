@@ -218,31 +218,51 @@ func TestSecureHandshakeWrongCode(t *testing.T) {
 	}
 }
 
-func TestSecureNoCodeIsPlaintext(t *testing.T) {
-	d, ch, _ := testDaemonHarness(t, "") // no security code
+func TestSecureForcedEncryptionNoCode(t *testing.T) {
+	// Forced encryption: even a daemon WITHOUT a real security code completes
+	// the handshake using the public default (000000) and then encrypts.
+	d, ch, binCh := testDaemonHarness(t, "") // no security code
 
-	client, sid := appSide(t, "123456", d.accessKey)
+	client, sid := appSide(t, defaultSecCode, d.accessKey)
 	d.handleMessage(&Message{
 		Type: TypePakeStart,
 		Sid:  base64.StdEncoding.EncodeToString(sid),
 		Pa:   base64.StdEncoding.EncodeToString(client.Share()),
 	}, "TS")
 
-	select {
-	case m := <-ch:
-		t.Fatalf("daemon without a code must ignore pake_start, but sent %s", m.data)
-	default:
+	reply := nextMsg(t, ch)
+	if reply.Type != TypePakeReply {
+		t.Fatalf("no-code daemon must answer pake_start with the default code, got %s", reply.Type)
 	}
-	if d.secureActive() {
-		t.Fatal("no code → no secure channel")
+	pb, _ := base64.StdEncoding.DecodeString(reply.Pb)
+	client.SetPeerShare(pb)
+	keys, err := client.Finish(sid, d.accessKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.handleMessage(&Message{Type: TypeSecConfirm, TagA: base64.StdEncoding.EncodeToString(TagA(keys, client.Transcript()))}, "TS")
+	if ok := nextMsg(t, ch); ok.Type != TypeSecOK {
+		t.Fatalf("expected sec_ok, got %s", ok.Type)
+	}
+	if ready := nextMsg(t, ch); ready.Type != TypeSecureReady {
+		t.Fatalf("expected secure_ready, got %s", ready.Type)
+	}
+	if !d.secureActive() {
+		t.Fatal("no-code daemon must still have an active secure channel")
 	}
 
-	// Data flows plaintext.
-	d.sendJSON(&Message{Type: TypeOutput, Data: "plain"})
+	// Data must be encrypted, not plaintext.
+	appCh, _ := NewSecureChannel(keys.Kc2s, keys.Ks2c, dirC2S[:], dirS2C[:])
+	d.sendJSON(&Message{Type: TypeOutput, Data: "encrypted even without a code"})
 	out := nextMsg(t, ch)
-	if out.Type != TypeOutput {
-		t.Fatalf("expected plaintext output, got %s", out.Type)
+	if out.Type != TypeEncTerm {
+		t.Fatalf("expected enc_term envelope, got %s", out.Type)
 	}
+	inner, err := appCh.UnwrapJSON(out)
+	if err != nil || inner.Data != "encrypted even without a code" {
+		t.Fatalf("decrypt failed: %v", err)
+	}
+	_ = binCh
 }
 
 func TestSecureResetDropsStale(t *testing.T) {
