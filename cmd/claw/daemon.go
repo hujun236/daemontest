@@ -820,29 +820,54 @@ func (d *Daemon) handleMessage(msg *Message, source string) {
 			d.ptyMgr.Resize(msg.SessionID, msg.Cols, msg.Rows)
 		}
 	case TypeSessionList:
+		// 强制加密：会话列表也只在握手完成后下发（未验证时泄露会话/系统信息）
+		if !d.checkSecCode() {
+			return
+		}
 		atomic.StoreInt32(&d.kicked, 0) // new frontend message, clearing kicked
 		d.handleSessionList()
 	case TypeRequestHistory:
+		if !d.checkSecCode() {
+			return
+		}
 		d.handleHistory(msg)
 	case TypePing:
 		d.sendJSON(&Message{Type: TypePong})
 	case TypeChannelSelect:
 		d.handleChannelSelect(msg)
 	case TypeFileSendCancel:
+		if !d.checkSecCode() {
+			return
+		}
 		d.handleFileSendCancel(msg)
 	case TypeFileRequest:
+		if !d.checkSecCode() {
+			return
+		}
 		d.handleFileRequest(msg)
 	case TypeFileListRequest:
+		if !d.checkSecCode() {
+			return
+		}
 		if d.fileTransfer != nil {
 			d.fileTransfer.sendFileList()
 		}
 	case TypeFileDelete:
+		if !d.checkSecCode() {
+			return
+		}
 		d.handleFileDelete(msg)
 	case TypeDirListRequest:
+		if !d.checkSecCode() {
+			return
+		}
 		if d.fileTransfer != nil {
 			d.fileTransfer.HandleDirListRequest(msg.Data)
 		}
 	case TypeReqPending:
+		if !d.checkSecCode() {
+			return
+		}
 		if d.fileTransfer != nil {
 			if err := d.fileTransfer.HandleReqPending(msg.Data); err != nil {
 				d.sendJSON(&Message{
@@ -852,18 +877,30 @@ func (d *Daemon) handleMessage(msg *Message, source string) {
 			}
 		}
 	case TypeProxyConnect:
+		if !d.checkSecCode() {
+			return
+		}
 		if d.proxyManager != nil {
 			d.proxyManager.HandleConnect(msg)
 		}
 	case TypeProxyClose:
+		if !d.checkSecCode() {
+			return
+		}
 		if d.proxyManager != nil {
 			d.proxyManager.HandleClose(msg)
 		}
 	case TypeProxyHttpFetch:
+		if !d.checkSecCode() {
+			return
+		}
 		if d.proxyManager != nil {
 			d.proxyManager.HandleHttpFetch(msg)
 		}
 	case TypeProxyWsConnect:
+		if !d.checkSecCode() {
+			return
+		}
 		if d.proxyManager != nil {
 			d.proxyManager.HandleWsConnect(msg)
 		}
@@ -1277,6 +1314,10 @@ func (d *Daemon) sendOutput(sessionID, data string, seq uint64) {
 	sub := d.subscribed[sessionID]
 	d.subMu.RUnlock()
 	if !sub {
+		return
+	}
+	// 强制加密：未完成握手前不下发会话内容（防通道切换重握手窗口期明文输出）
+	if atomic.LoadInt32(&d.secCodeVerified) != 1 {
 		return
 	}
 	d.sendJSON(&Message{

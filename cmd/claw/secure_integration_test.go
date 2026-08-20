@@ -297,4 +297,36 @@ func TestSecureResetDropsStale(t *testing.T) {
 	}
 }
 
+// TestSecureContentGatedBeforeHandshake: before the SPAKE2 handshake completes,
+// the daemon must NOT serve any session content (session_list / history /
+// file / proxy) — forced encryption means an unverified connection gets
+// "Security code required", never plaintext content.
+func TestSecureContentGatedBeforeHandshake(t *testing.T) {
+	d, ch, _ := testDaemonHarness(t, "123456")
+
+	// No handshake performed. session_list must be rejected.
+	d.handleMessage(&Message{Type: TypeSessionList}, "TS")
+	errMsg := nextMsg(t, ch)
+	if errMsg.Type != TypeError || errMsg.Error != "Security code required" {
+		t.Fatalf("session_list before handshake must be rejected, got %+v", errMsg)
+	}
+
+	// request_history must be rejected too.
+	d.handleMessage(&Message{Type: TypeRequestHistory, SessionID: "s1"}, "TS")
+	errMsg2 := nextMsg(t, ch)
+	if errMsg2.Type != TypeError || errMsg2.Error != "Security code required" {
+		t.Fatalf("request_history before handshake must be rejected, got %+v", errMsg2)
+	}
+
+	// File/proxy requests must be rejected.
+	d.handleMessage(&Message{Type: TypeDirListRequest, Data: "/"}, "TS")
+	if m := nextMsg(t, ch); m.Type != TypeError {
+		t.Fatalf("dir_list_request before handshake must be rejected, got %+v", m)
+	}
+	d.handleMessage(&Message{Type: TypeProxyHttpFetch, SessionID: "p1"}, "TS")
+	if m := nextMsg(t, ch); m.Type != TypeError {
+		t.Fatalf("proxy_http_fetch before handshake must be rejected, got %+v", m)
+	}
+}
+
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
