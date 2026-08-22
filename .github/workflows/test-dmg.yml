@@ -1,0 +1,47 @@
+name: Test DMG (build-macos.sh)
+
+# TEMP test workflow (test repo only): run build-macos.sh on a macOS runner
+# to verify the script itself, then publish the unsigned DMG as a prerelease.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-dmg:
+    name: build-macos.sh
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run build-macos.sh
+        run: bash build-macos.sh
+
+      - name: Verify outputs
+        run: |
+          set -e
+          ls -lh CLIAnywhere.app/Contents/MacOS/claw \
+                CLIAnywhere.app/Contents/Resources/AppIcon.icns \
+                CLIAnywhere.app/Contents/Resources/localattachwebapp.zip \
+                CLIAnywhere-*.dmg
+          hdiutil verify CLIAnywhere-*.dmg
+
+      - name: Create test release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          tag="test-dmg-$(date +'%Y%m%d-%H%M%S')"
+          gh release create "$tag" CLIAnywhere-*.dmg \
+            -R "${{ github.repository }}" \
+            --title "$tag" \
+            --notes "Unsigned DMG test build via build-macos.sh. SHA: ${{ github.sha }}" \
+            --prerelease
